@@ -1,0 +1,10 @@
+{
+  "total_value_inr": 5000000,
+  "monthly_expenses_inr": 150000,
+  "assets": [
+    { "name": "BTC",         "allocation_pct": 55, "expected_crash_pct": -80 },
+    { "name": "ETH",         "allocation_pct": 25, "expected_crash_pct": -85 },
+    { "name": "RELIANCE.NS", "allocation_pct": 15, "expected_crash_pct": -50 },
+    { "name": "CASH",        "allocation_pct":  5, "expected_crash_pct":   0 }
+  ]
+}

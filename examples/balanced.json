@@ -1,0 +1,10 @@
+{
+  "total_value_inr": 10000000,
+  "monthly_expenses_inr": 80000,
+  "assets": [
+    { "name": "BTC",     "allocation_pct": 30, "expected_crash_pct": -80 },
+    { "name": "NIFTY50", "allocation_pct": 40, "expected_crash_pct": -40 },
+    { "name": "GOLD",    "allocation_pct": 20, "expected_crash_pct": -15 },
+    { "name": "CASH",    "allocation_pct": 10, "expected_crash_pct":   0 }
+  ]
+}
