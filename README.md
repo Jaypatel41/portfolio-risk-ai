@@ -369,14 +369,10 @@ Linting       ruff
 
 ---
 
-## Resume Summary
+## Summary
 
 > Built AI-powered portfolio risk advisor with dual-LLM hallucination guard (Decision Spine pattern + critic pass), empirical VaR/CVaR from 1,257 trading days of historical data, 10,000-path Monte Carlo simulation preserving cross-asset correlation, and natural-language stress-test parser — achieving 100% schema-valid LLM outputs across 26+ test cases with zero invented metrics.
 
 **Skills demonstrated:** LLM prompt engineering · Structured output / JSON schema enforcement · Pydantic v2 · Statistical risk modeling (VaR, CVaR, Monte Carlo) · Async Python (asyncio, httpx) · REST API integration · Exponential backoff and fault isolation · Streamlit deployment · Unit testing with mocked external dependencies
 
 ---
-
-## License
-
-MIT
