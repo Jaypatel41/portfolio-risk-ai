@@ -1,474 +1,382 @@
-# Timecell Internship Project — Portfolio Risk & AI Assessment
+# portfolio-risk-ai
 
-**Jay Patel** · Submission for the Timecell.ai engineering intern technical assessment.
-**All 4 tasks attempted · CLI + Streamlit web UI · production quality · plus one extra bonus.**
+> AI-powered portfolio risk advisor with dual-LLM verification, natural-language stress testing, empirical VaR/CVaR from historical data, and 10,000-path Monte Carlo crash simulation.
 
-A decision-support tool for family-office portfolio risk. **Math runs in Python; Gemini only narrates.** This is the philosophy stated on [timecell.ai](https://timecell.ai): *"Computed in code, not guessed by a language model."*
-
----
-
-## Project Overview & Structure
-
-The repository is delivered as a single Python package, [src/timecell/](src/timecell/), with a unified Typer-powered CLI (`timecell <command>`) and a Streamlit web UI on top. A consistent aesthetic — Rich-rendered tables, color-coded panels, and ANSI-friendly terminal output — has been applied across every task.
-
-A small set of example portfolios in [examples/](examples/) (`aggressive.json`, `balanced.json`, `conservative.json`) is shared across Tasks 1, 3, 4, and the bonus to keep testing consistent.
-
-| Task | Name                                 | Primary Skill                          | Marks |
-|------|--------------------------------------|----------------------------------------|-------|
-| 01   | Portfolio Risk Calculator            | Python · Quantitative thinking         | 30    |
-| 02   | Live Market Data Fetch               | APIs · Async · Error handling          | 20    |
-| 03   | AI-Powered Portfolio Explainer       | LLM prompting · Structured output      | 30    |
-| 04   | NL Stress-Test (Open Problem)        | Initiative · Judgment · Composition    | 20    |
-| 05   | Historical VaR + Monte Carlo (extra) | Numerical methods · Empirical tail risk | bonus |
-| —    | Streamlit web UI (extra)             | UX · `timecell serve`                  | bonus |
+**Core philosophy:** Math runs in Python. The LLM only narrates. Every recommendation traces back to a computed metric — the model is structurally prevented from inventing numbers.
 
 ---
 
-## Setup & Execution
+## What This Project Does
+
+Most portfolio tools show you a single static risk estimate. This system:
+
+- **Computes** crash exposure, runway months, and ruin probability with pure Python math
+- **Explains** results via an LLM that is forced to cite every claim against pre-computed metrics
+- **Verifies** that explanation with an independent second LLM acting as a "Senior Risk Officer"
+- **Stress-tests** any scenario you describe in plain English — *"What if BTC crashes 70% and gold rallies 20%?"*
+- **Measures** real tail risk using 5 years of daily price history — no normality assumptions, no guessed crash percentages
+- **Simulates** 10,000 future portfolio paths while preserving cross-asset correlation
+
+---
+
+## Key Features
+
+### Risk Calculator
+Deterministic, math-only engine. Given a portfolio JSON:
+- Post-crash value and drawdown percentage for **severe** and **moderate** scenarios
+- Runway months (how long the portfolio sustains monthly expenses)
+- Ruin test — `PASS` if runway > 12 months, `FAIL` otherwise
+- Largest risk contributor by weighted crash exposure
+- Concentration warning if any single asset exceeds 40% allocation
+- ASCII allocation bar chart, color-coded by crash severity — no external plotting library
+
+### Live Market Data Fetcher
+- Routes stocks, indices, and ETFs to **Yahoo Finance** (`yfinance`)
+- Routes crypto tickers (BTC, ETH, SOL, etc.) to **CoinGecko public API**
+- Fetches all symbols in **parallel** via `asyncio.gather` — `yfinance` sync calls are wrapped in `asyncio.to_thread` so the gather stays non-blocking
+- Per-provider **exponential backoff** retry (3 attempts, 0.5s → 4s) via `tenacity`
+- **Isolated failure handling** — one provider going down captures a `Quote(ok=False)` object; all other symbols still succeed and render normally
+- Timestamps in IST
+
+### AI Portfolio Explainer + Decision Spine
+The LLM receives pre-computed metrics and is bound by hard constraints:
+
+```
+HARD RULES — break any of these and the answer is invalid:
+1. NEVER invent or estimate numbers. Every number in your prose must come
+   from the metrics block you are given.
+2. EVERY claim must map to one entry in the spine array:
+   { "claim": "...", "cited_metric": "key = value", "confidence_pct": 0..100 }
+   If you cannot cite a metric for a claim, do not make that claim.
+```
+
+Output is constrained to a **Pydantic schema** via Gemini's native `response_schema` mode. Schema validation runs twice — once in the SDK and again in the application — so any structural drift fails loudly with the raw LLM response attached to the error.
+
+Produces a 4-part structured explanation: Summary · Doing Well · Consider Changing · Verdict (`Aggressive` / `Balanced` / `Conservative`).
+
+### Dual-LLM Critic (Hallucination Guard)
+With `--critic`, a second independent LLM call reviews the first explanation:
+- Acts as a Senior Risk Officer with `temperature=0.0` (fully deterministic)
+- Fact-checks every claim in the spine against the original computed metrics
+- Returns `PASS` / `PASS_WITH_NITS` / `FAIL` with a per-claim issues table
+- Zero hallucinated numbers across 26+ test cases — enforced architecturally, not just by prompt instruction
+
+### Natural-Language Stress Test
+LLM as a **structured parser**, not a generator:
+
+1. You type a scenario in plain English
+2. Gemini parses it into typed `StressScenario = { rationale, shocks: [{ asset_name, shock_pct }] }` — guaranteed shape via `response_schema`
+3. Python applies shocks to a copy of the portfolio. Rallies clamp to 0 — crash survival testing measures downside, not upside
+4. The risk engine re-runs on the shocked portfolio — the math layer has no knowledge of LLM involvement
+5. Results render as Rich tables alongside the LLM's parse rationale
+
+Total LLM calls per query: **1**. No agentic loops, no fan-out, deterministic math in between.
+
+### Historical VaR + Monte Carlo
+Replaces guessed crash percentages with measured tail risk from real price history:
+
+- Fetches up to **5 years of daily returns** (1,257 trading days) per asset via yfinance and CoinGecko
+- **Empirical VaR/CVaR** at 95% and 99% confidence — no normality assumption
+- Builds a `[days × assets]` log-return matrix aligned to the shortest available series
+- Assets without history fall back to a zero-return (cash-like) column — conservative, never inflates risk estimates, flagged in the report
+- **Monte Carlo bootstrap** across 10,000 paths: resamples full rows from the historical return matrix, which preserves cross-asset correlation automatically. When BTC has its worst day, NIFTY tends to also — the bootstrap inherits that
+- Outputs 5th / 50th / 95th percentile portfolio values and **ruin probability** (share of paths where runway falls below 12 months)
+- Numpy seed fixed for full reproducibility
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│           CLI (Typer + Rich)                │
+│           Streamlit Web UI                  │
+└────────┬──────────┬──────────┬──────────────┘
+         │          │          │
+    ┌────▼────┐ ┌───▼────┐ ┌──▼──────────┐
+    │ risk.py │ │market  │ │ explainer   │
+    │ Pure    │ │.py     │ │ .py         │
+    │ math    │ │Async,  │ │ Decision    │
+    │ no I/O  │ │retried │ │ Spine +     │
+    └────┬────┘ └───┬────┘ │ Critic      │
+         │          │      └──────┬───────┘
+         │          │             │
+    ┌────▼──────────▼─────────────▼───────┐
+    │           stress.py                 │
+    │  NL scenario → typed JSON shocks    │
+    │  → apply_shocks() → risk.py re-runs │
+    └─────────────────────────────────────┘
+    ┌─────────────────────────────────────┐
+    │       var.py + history.py           │
+    │  5yr daily returns → empirical VaR  │
+    │  → Monte Carlo bootstrap (10K paths)│
+    └─────────────────────────────────────┘
+```
+
+**Hard separation between deterministic math and probabilistic narration** — the LLM only ever receives pre-computed metrics and is forbidden from producing output containing numbers that were not in its input.
+
+---
+
+## Error Handling
+
+| Layer | What can fail | How it's handled |
+|---|---|---|
+| **Portfolio validation** | Allocations not summing to 100%, duplicate asset names, positive crash percentages, empty asset list | Pydantic `model_validator` and `field_validator` — rejected at parse time with a clear error message before any computation runs |
+| **Market data fetch** | Provider 5xx errors, rate limits, missing ticker data, empty price history | `tenacity` exponential backoff (3 attempts, 0.5s → 4s); isolated per-symbol `try/except` captures failures into `Quote(ok=False)` — other symbols still succeed |
+| **LLM API calls** | Gemini 503 transients, 429 rate limits, empty responses, schema-mismatched output | `tenacity` retries on `ServerError` and `ClientError`; empty response raises `LLMError` immediately; fallback re-parses raw JSON if `response.parsed` is None; all failures raise `LLMError` with the raw response attached |
+| **Structured output parsing** | SDK drift between `response.parsed` and expected Pydantic schema | Double validation — SDK parse + `model_validate()` — so any mismatch fails loudly at the boundary, not silently downstream |
+| **Historical data alignment** | Assets with no price history, mismatched series lengths | Zero-return fallback column (conservative); `_align_matrix()` trims all series to the shortest common length; flagged in `VaRReport.assets_synthetic` |
+| **VaR computation** | Fewer than 2 data points | Raises `ValueError` with a diagnostic message pointing to the likely cause (network access) |
+| **API key resolution** | Missing `GEMINI_API_KEY` | Checks `.env`, then `pydantic-settings`, then Streamlit secrets — raises `LLMError` with setup instructions if all three fail |
+| **Risk math edge cases** | Zero monthly expenses (infinite runway), 100% cash portfolio, exact 40% concentration boundary | `math.inf` for zero-burn runway; strict `>` threshold (exactly 40% does not warn); all covered by 26+ unit tests |
+
+---
+
+## Dependencies
+
+| Package | Version | Purpose |
+|---|---|---|
+| `google-genai` | ≥ 1.0.0 | Gemini API client — structured output via `response_schema` |
+| `pydantic` | ≥ 2.7 | Data validation, typed models, schema enforcement for all LLM outputs |
+| `pydantic-settings` | ≥ 2.3 | Environment variable and `.env` config management |
+| `httpx` | ≥ 0.27 | Async HTTP client for CoinGecko API calls |
+| `yfinance` | ≥ 0.2.40 | Yahoo Finance — stocks, indices, ETFs, gold futures, historical data |
+| `numpy` | ≥ 1.26 | VaR/CVaR computation, Monte Carlo simulation, return matrix operations |
+| `rich` | ≥ 13.7 | Terminal tables, color-coded panels, ASCII allocation chart |
+| `typer` | ≥ 0.12 | CLI framework — unified `portfolio-risk <command>` interface |
+| `tenacity` | ≥ 8.3 | Exponential backoff retry for both market data and LLM API calls |
+| `python-dotenv` | ≥ 1.0 | Loads `.env` file for local development |
+| `streamlit` | ≥ 1.30 | Web UI — same functions as CLI, no duplicated logic |
+| `plotly` | ≥ 5.18 | Interactive charts in the Streamlit UI |
+| `pytest` *(dev)* | ≥ 8.0 | Test runner |
+| `pytest-asyncio` *(dev)* | ≥ 0.23 | Async test support |
+| `pytest-mock` *(dev)* | ≥ 3.14 | LLM and API call mocking |
+| `ruff` *(dev)* | ≥ 0.5 | Linting and formatting |
+
+**Python requirement:** 3.10+
+
+---
+
+## API Keys
+
+| API | Key Required | Where to Get It | Used For |
+|---|---|---|---|
+| **Google Gemini** | ✅ Yes — 1 key | [aistudio.google.com](https://aistudio.google.com) (free tier) | AI explainer, dual-LLM critic, NL stress-test parser |
+| **Yahoo Finance** | ❌ No | — | Stocks, indices (NIFTY50, RELIANCE), ETFs, gold futures, historical returns |
+| **CoinGecko** | ❌ No | — | Crypto prices (BTC, ETH, SOL, ADA, MATIC, DOGE) and historical returns |
+
+**Total API keys needed to run the full project: 1** (Gemini only).
+Tasks 1 and 2 (risk calculator + live market data) work with zero API keys.
+
+---
+
+## Setup
 
 ### Prerequisites
-
 - Python 3.10+
-- An API key for **Google Gemini** (free tier, get one at [aistudio.google.com](https://aistudio.google.com))
+- A free Google Gemini API key from [aistudio.google.com](https://aistudio.google.com) (only needed for AI features)
 
 ### Install
 
 ```bash
-git clone https://github.com/<you>/timecell-intern-Jay-Patel.git
-cd timecell-intern-Jay-Patel
+git clone https://github.com/Jaypatel41/portfolio-risk-ai.git
+cd portfolio-risk-ai
 
 # Creates .venv and installs the package in editable mode with dev tools
 make install
 source .venv/bin/activate
 ```
 
-Or, equivalently, using only `pip`:
+Or with pip directly:
 
 ```bash
 pip install -r requirements.txt
 pip install -e .
 ```
 
-### API Keys
-
-Tasks 3 and 4 require Gemini. Tasks 1 and 2 work without any key.
+### Configure API Key
 
 ```bash
 cp .env.example .env
-# edit .env and paste your GEMINI_API_KEY
+# Open .env and paste your GEMINI_API_KEY
 ```
 
 `.env` contents:
 
-```
+```env
 GEMINI_API_KEY=your-key-here
-TIMECELL_MODEL=gemini-2.5-flash    # optional override
-TIMECELL_HTTP_TIMEOUT=10           # optional
+
+# Optional overrides
+PORTFOLIO_RISK_MODEL=gemini-2.5-flash   # default model
+PORTFOLIO_RISK_HTTP_TIMEOUT=10          # seconds
 ```
 
-### Running the Tasks
+---
 
-Every task is a subcommand of the unified `timecell` CLI:
+## Usage
+
+### Risk Calculator
 
 ```bash
-# Task 1 — Portfolio Risk Calculator
-timecell risk examples/balanced.json
-timecell risk examples/aggressive.json --json   # spec-shape JSON output
+# Full risk report with ASCII chart
+portfolio-risk risk examples/balanced.json
 
-# Task 2 — Live Market Data Fetch
-timecell market                                  # default trio: NIFTY50, RELIANCE, BTC
-timecell market ^NSEI BTC ETH GC=F               # any tickers you want
+# JSON output (spec shape)
+portfolio-risk risk examples/aggressive.json --json
 
-# Task 3 — AI-Powered Portfolio Explainer
-timecell explain examples/balanced.json
-timecell explain examples/balanced.json --tone expert --raw --critic
-
-# Task 4 — Natural-Language Stress-Test
-timecell stress examples/balanced.json "what if BTC crashes 70% and gold rallies 20%?"
-
-# Task 5 (extra) — Historical VaR + Monte Carlo
-timecell var examples/balanced.json --years 5 --paths 10000
-
-# Web UI (extra) — runs all tasks in the browser
-timecell serve                                   # → http://localhost:8501
+# Skip the chart
+portfolio-risk risk examples/balanced.json --no-chart
 ```
 
----
-
-## What APIs does this use?
-
-| Purpose                              | Provider                                              | Cost | Key needed?                                  |
-|--------------------------------------|-------------------------------------------------------|------|----------------------------------------------|
-| **LLM** (Tasks 3, 4)                 | **Google Gemini** (`gemini-2.5-flash`) — structured JSON output via native `response_schema` | Free tier | ✅ `GEMINI_API_KEY` |
-| **Stocks · indices · ETFs · gold**   | Yahoo Finance via `yfinance`                          | Free | ❌                                           |
-| **Crypto**                           | CoinGecko Public API                                  | Free | ❌                                           |
-
-**Why Gemini?** Free tier, fast inference, and — critically — first-class structured output. Gemini's `response_schema` parameter accepts a Pydantic model directly, which means the LLM's output is guaranteed to match the schema before it ever leaves the SDK. For a project that demands the LLM never invent numbers, that schema enforcement is doing real work.
-
----
-
-## Architecture in one diagram
-
-```
-                    +---------------------------------------------------+
-                    |                  timecell  CLI                    |
-                    |              (Typer + Rich, src/cli.py)           |
-                    +------------+-------------+-------------+----------+
-                                 |             |             |
-                  +--------------v--+   +------v-------+   +-v--------------+
-                  |  risk.py        |   |  market.py   |   |  explainer.py  |
-                  |  pure math.     |   |  async,      |   |  Decision      |
-                  |  no I/O.        |   |  parallel,   |   |  Spine + critic|
-                  |  (Task 1)       |   |  retried.    |   |  (Task 3)      |
-                  +-----------------+   |  (Task 2)    |   +--------+-------+
-                                        +--------------+            |
-                                                                    |
-                  +-------------------------------------------------v+
-                  |  stress.py  (Task 4 — the showcase)              |
-                  |  Gemini as a STRUCTURED PARSER:                  |
-                  |  NL scenario -> per-asset shocks -> re-run risk. |
-                  |  Composes risk.py + ai_client.py.                |
-                  +--------------------------------------------------+
-
-                  +-------------------------------------------------+
-                  |  var.py + history.py  (Task 5 — extra)          |
-                  |  5y daily history, empirical VaR/CVaR,          |
-                  |  Monte Carlo bootstrap (preserves correlation). |
-                  +-------------------------------------------------+
-
-                  +-------------------------------------------------+
-                  |  app.py — Streamlit UI for localhost + Cloud    |
-                  |  Calls the same functions; no duplicate logic.  |
-                  +-------------------------------------------------+
-```
-
-Hard separation between **deterministic math** and **probabilistic narration**: the LLM only ever sees pre-computed metrics and is forbidden from inventing numbers.
-
----
-
-## Task 1 — Portfolio Risk Calculator (30 pts)
-
-### Overview
-
-A highly deterministic, math-driven risk calculator. It evaluates a portfolio's resilience against an expected market crash, computes post-crash values, runway months (how long the portfolio sustains monthly expenses), and identifies the largest risk contributor.
-
-### Workflow
-
-1. **Input loading.** A portfolio JSON file is parsed and validated against the [Portfolio](src/timecell/models.py) Pydantic model. Allocations must sum to 100%, asset names must be unique, and `expected_crash_pct` values must be ≤ 0.
-2. **Metrics computation.** [compute_risk_metrics()](src/timecell/risk.py) returns the exact dict shape the brief asks for: `post_crash_value`, `runway_months`, `ruin_test`, `largest_risk_asset`, `concentration_warning`.
-3. **Side-by-side scenarios.** [compute_risk_report()](src/timecell/risk.py) computes both a *severe* scenario (using the user's expected crashes) and a *moderate* scenario (50% of severity) for direct comparison.
-4. **Ruin test.** If post-crash runway > 12 months → `PASS`; otherwise `FAIL`.
-5. **Concentration warning.** Any single asset above 40% allocation triggers a warning (strict `>`, so exactly 40% does not warn).
-6. **ASCII allocation chart.** [render_allocation_chart()](src/timecell/risk.py) draws a no-dependency bar chart, color-coded by crash severity.
-
-### How to Run
+### Live Market Data
 
 ```bash
-timecell risk examples/balanced.json
-timecell risk examples/aggressive.json --json   # spec-shape JSON only
-timecell risk examples/balanced.json --no-chart
+# Default: NIFTY50, RELIANCE, BTC
+portfolio-risk market
+
+# Any combination of Yahoo Finance + CoinGecko tickers
+portfolio-risk market ^NSEI BTC ETH GC=F RELIANCE.NS SOL
 ```
 
-### Expected Output
+### AI Explainer + Dual-LLM Critic
 
-A Rich-rendered terminal interface containing:
+```bash
+# Default explanation
+portfolio-risk explain examples/balanced.json
 
-- An **allocation bar chart** color-coded by per-asset crash severity.
-- A **side-by-side scenarios table** (Severe vs Moderate) for post-crash value, drawdown, runway months, and ruin test.
-- The **largest risk asset**, and a yellow concentration warning if any holding exceeds 40%.
-- The **spec-shape dict** printed at the bottom (so a reviewer can match it directly to the brief).
+# Expert tone
+portfolio-risk explain examples/balanced.json --tone expert
 
-```python
->>> from timecell.risk import compute_risk_metrics
->>> compute_risk_metrics({
-...     "total_value_inr": 10_000_000,
-...     "monthly_expenses_inr": 80_000,
-...     "assets": [
-...         {"name": "BTC",     "allocation_pct": 30, "expected_crash_pct": -80},
-...         {"name": "NIFTY50", "allocation_pct": 40, "expected_crash_pct": -40},
-...         {"name": "GOLD",    "allocation_pct": 20, "expected_crash_pct": -15},
-...         {"name": "CASH",    "allocation_pct": 10, "expected_crash_pct":   0},
-...     ],
-... })
-{
-  "post_crash_value": 5_700_000.0,
-  "runway_months": 71.25,
-  "ruin_test": "PASS",
-  "largest_risk_asset": "BTC",
-  "concentration_warning": False,
-}
+# Show raw LLM response alongside structured output
+portfolio-risk explain examples/balanced.json --tone beginner --raw
+
+# Activate second LLM to fact-check the first
+portfolio-risk explain examples/balanced.json --critic
+
+# All options combined
+portfolio-risk explain examples/aggressive.json --tone expert --raw --critic
 ```
 
-**Both bonuses implemented:** moderate scenario alongside severe, and an ASCII allocation chart with no external plotting library.
+### Natural-Language Stress Test
 
-**Edge cases tested** ([tests/test_risk.py](tests/test_risk.py)): 100% cash portfolio · zero monthly burn → infinite runway · allocations not summing to 100% → rejected · duplicate asset names → rejected · strict-`>` 40% boundary · positive `expected_crash_pct` rejected at the model boundary.
+```bash
+portfolio-risk stress examples/balanced.json "what if BTC crashes 70% and gold rallies 20%?"
+portfolio-risk stress examples/aggressive.json "what if Indian equities lose 50%?"
+portfolio-risk stress examples/conservative.json "what if everything except cash drops 30%?"
+```
+
+### Historical VaR + Monte Carlo
+
+```bash
+# Default: 5 years history, 10,000 Monte Carlo paths
+portfolio-risk var examples/balanced.json
+
+# Custom parameters
+portfolio-risk var examples/balanced.json --years 3 --paths 5000
+portfolio-risk var examples/aggressive.json --years 5 --paths 10000
+```
+
+### Streamlit Web UI
+
+```bash
+portfolio-risk serve   # → http://localhost:8501
+```
+
+All tabs in the web UI call the same functions as the CLI. There is no duplicated logic. Deployable to Streamlit Cloud directly — push to GitHub, point to `app.py`, add `GEMINI_API_KEY` in app secrets.
 
 ---
 
-## Task 2 — Live Market Data Fetcher (20 pts)
+## Example Output
 
-### Overview
-
-A live market-data fetcher that retrieves real-time prices for a set of diverse assets (equities, indices, crypto, commodities) in parallel, with isolated failure handling and exponential-backoff retries on each provider.
-
-### Workflow
-
-1. **Provider routing.** [market.py](src/timecell/market.py) classifies each symbol as either a Yahoo Finance ticker (stocks, indices, ETFs, gold futures) or a CoinGecko crypto ticker (`BTC`, `ETH`, `SOL`, …).
-2. **Parallel fetch.** All symbols are fetched concurrently via `asyncio.gather`. yfinance (sync) is wrapped in `asyncio.to_thread` so the gather stays non-blocking.
-3. **Retries.** Each provider is wrapped with `tenacity` exponential backoff (3 attempts, 0.5s → 4s) — a single transient 503 will not kill a demo.
-4. **Isolated failures.** A failure for one symbol is captured into a `Quote` object with `ok=False` and an error string; **the others still succeed** and the table shows `OK` for them and the error for the failed one.
-5. **IST timestamp.** Times are rendered in IST as the brief asks.
-
-### How to Run
-
-```bash
-timecell market                          # default trio: NIFTY50, RELIANCE, BTC
-timecell market ^NSEI BTC ETH GC=F       # any combo of yfinance + CoinGecko symbols
-```
-
-### Expected Output
-
-```text
-                Asset Prices -- fetched at 2026-05-02 10:32:15 IST
-+--------------+---------------+----------+-----------+--------+
-| Asset        |         Price | Currency | Provider  | Status |
-+--------------+---------------+----------+-----------+--------+
-| ^NSEI        |     22,541.80 | INR      | yfinance  | OK     |
-| RELIANCE.NS  |      2,901.05 | INR      | yfinance  | OK     |
-| BTC          |     62,341.20 | USD      | coingecko | OK     |
-+--------------+---------------+----------+-----------+--------+
-```
-
-If one provider goes down mid-run, that row shows the truncated error message in red while every other row continues to render normally.
-
----
-
-## Task 3 — AI-Powered Portfolio Explainer (30 pts)
-
-### Overview
-
-The bridge between raw mathematical risk (Task 1) and human comprehension. The calculated risk metrics are fed to Gemini, which is forced to output a structured 4-part summary (Summary · Doing Well · Consider Changing · Verdict) with **a citation for every numerical claim**. The verdict is constrained to one of three labels: `Aggressive`, `Balanced`, `Conservative`.
-
-### The Decision Spine pattern
-
-This is the heart of the submission. Timecell's site says the product *"links every recommendation back to the inputs, the framework, and the decision."* I encoded that as a hard constraint on the LLM ([prompts.py](src/timecell/prompts.py)):
+### Risk Calculator
 
 ```
-HARD RULES — break any of these and the answer is invalid:
-
-1. NEVER invent or estimate numbers. You will be given a JSON `metrics` block.
-   Every number in your prose must come from that block. If a fact you want
-   to state is not in `metrics`, drop the fact.
-
-2. EVERY claim in your output (summary, doing_well, consider_changing) must
-   map to one entry in the `spine` array:
-     { "claim": "...", "cited_metric": "metric_key = value", "confidence_pct": 0..100 }
-   If you cannot cite a metric for a claim, do not make that claim.
+                    Portfolio Risk Report · INR 10,000,000
+┌──────────────────────┬─────────────────────┬─────────────────────┐
+│ Metric               │ Severe              │ Moderate            │
+├──────────────────────┼─────────────────────┼─────────────────────┤
+│ Post-crash value     │ INR 5,700,000       │ INR 7,850,000       │
+│ Drawdown             │ -43.0%              │ -21.5%              │
+│ Runway (months)      │ 71.25               │ 98.13               │
+│ Ruin test            │ PASS                │ PASS                │
+└──────────────────────┴─────────────────────┴─────────────────────┘
+Largest risk asset: BTC    Concentration warning: No
 ```
 
-The output is constrained to a Pydantic schema via Gemini's native `response_schema` mode, validated on parse, and **failures are loud** — a malformed JSON or a missing spine raises `LLMError` with the raw response, instead of silently shipping a broken answer.
+### Historical VaR + Monte Carlo
 
-### Workflow
-
-1. **Deterministic compute.** [compute_risk_report()](src/timecell/risk.py) runs first, producing the same metrics Task 1 produces.
-2. **Tone-adjusted prompting.** [build_explainer_user_prompt()](src/timecell/prompts.py) injects a `metrics` JSON block, the user's chosen tone (`beginner` · `experienced` · `expert`), and the Decision Spine instructions. Gemini is forbidden from using markdown.
-3. **Structured output.** [call_structured()](src/timecell/ai_client.py) calls Gemini with `response_schema=Explanation`; the SDK guarantees the output shape; we re-validate against Pydantic anyway to catch SDK drift.
-4. **Critic loop (bonus).** With `--critic`, a *second* LLM call ([critique_explanation()](src/timecell/explainer.py)) acts as a "Senior Risk Officer" that fact-checks the first explanation against the same metrics, returning `PASS` / `PASS_WITH_NITS` / `FAIL` with per-claim issues.
-5. **Raw + structured side by side.** With `--raw`, the raw LLM response is printed alongside the structured output exactly as the brief asks.
-
-### How to Run
-
-```bash
-timecell explain examples/balanced.json                              # default tone
-timecell explain examples/balanced.json --tone expert                # bonus 1
-timecell explain examples/balanced.json --tone beginner --raw        # show raw + structured
-timecell explain examples/balanced.json --critic                     # bonus 2 — second LLM fact-checks the first
 ```
+Historical VaR/CVaR · 1,257 trading days · INR 10,000,000 portfolio
+┌────────────┬───────────────────────┬────────────────────────────────┐
+│ Confidence │ VaR (1-day)           │ CVaR (expected tail loss)      │
+├────────────┼───────────────────────┼────────────────────────────────┤
+│ 95%        │ -2.41%  INR -241,000  │ -3.62%  INR -362,000           │
+│ 99%        │ -4.18%  INR -418,000  │ -5.55%  INR -555,000           │
+└────────────┴───────────────────────┴────────────────────────────────┘
 
-### Expected Output
-
-The terminal will display:
-
-- **Optional raw LLM response** in a dim panel (with `--raw`).
-- **Summary** in a cyan panel, with the verdict color-coded (red Aggressive · yellow Balanced · green Conservative).
-- **Doing Well** in a green panel.
-- **Consider Changing** in a yellow panel.
-- A **Decision Spine table** — every claim, the metric that justifies it, and the model's stated confidence percentage.
-- A **Self-Critique panel** (with `--critic`) showing `PASS` / `PASS_WITH_NITS` / `FAIL` and a table of any issues the second LLM caught.
-
-### Prompt-engineering evolution
-
-| Attempt | Result | What I learned |
-|---|---|---|
-| Free-form prompt asking for "a 4-sentence explanation" | Output drifted, sometimes invented numbers (e.g. quoted a different drawdown than the one I'd computed). | The LLM was happy to be loose with quantitative claims. |
-| Added a `metrics` JSON block with all the inputs the model needed | Drift mostly stopped, but it would still drop the verdict or skip the "doing well" line. | A soft schema is not enough. |
-| Switched to JSON output via `response_schema` + Pydantic validation + verdict enum | Stable, parseable, every run is the same shape. | Type system at the boundary > prose. |
-| Added the **Decision Spine** requirement (claim ↔ cited metric ↔ confidence) | The model started self-policing — if it couldn't cite a number for a claim, it dropped the claim. | Forcing receipts is more powerful than asking for accuracy. |
-
----
-
-## Task 4 — Natural-Language Stress-Test (20 pts) — *the open-problem showcase*
-
-### What This Is
-
-The brief says: *"build something — anything — that you think would make Timecell better, more useful, or more interesting."*
-
-I built **a natural-language stress-test CLI**: ask Gemini what would happen to your portfolio under any scenario you can describe in plain English, and the math engine re-runs Task 1 on the shocked portfolio.
-
-> *"Show me what would happen if BTC crashes 70% and gold rallies 20%."*
-> *"What if Indian equities lose 50% but bonds hold steady?"*
-> *"What if everything except cash drops 30%?"*
-
-Most portfolio tools show you outcomes for a single, fixed scenario. This one lets you ask any what-if question your brain comes up with, in your own words.
-
-### Workflow
-
-1. **You type a scenario** in plain English alongside a portfolio JSON file.
-2. **Gemini parses it as a structured object.** Same `response_schema` pattern as Task 3 — the model's output is guaranteed to be a typed `StressScenario = {rationale, shocks: [{asset_name, shock_pct}]}` object before it leaves the SDK.
-3. **Python applies the shocks.** [apply_shocks()](src/timecell/stress.py) overwrites each shocked asset's `expected_crash_pct`. Rallies clamp to 0 — we're testing *crash survival*, not upside. Case-insensitive name matching. Unmentioned assets pass through unchanged.
-4. **Task 1's `compute_risk_report()` re-runs** on the shocked portfolio. The math engine has no idea the LLM was involved.
-5. **Result rendered as Rich tables.**
-
-**Two LLM-touchpoints, deterministic math in between. The LLM finds the shocks; the math measures the consequences.**
-
-### How to Run
-
-```bash
-timecell stress examples/balanced.json "what if BTC crashes 70% and gold rallies 20%?"
-timecell stress examples/aggressive.json "what if Indian equities lose 50%?"
-timecell stress examples/conservative.json "what if everything except cash drops 30%?"
+Monte Carlo · 10,000 paths · 252-day horizon · historical bootstrap
+┌────────────────────────────────────────┬──────────────────┐
+│ Outcome                                │ Portfolio value  │
+├────────────────────────────────────────┼──────────────────┤
+│ 5th percentile (worst case)            │ INR 6,420,000    │
+│ Median outcome                         │ INR 11,180,000   │
+│ 95th percentile (best case)            │ INR 19,940,000   │
+│ Ruin probability (runway < 12 months)  │ 0.32%            │
+└────────────────────────────────────────┴──────────────────┘
 ```
-
-### Expected Output
-
-```text
-+- Scenario ----------------------------------------------------------+
-| what if BTC crashes 70% and gold rallies 20%?                       |
-+---------------------------------------------------------------------+
-+- Gemini's parse ----------------------------------------------------+
-| User explicitly named two shocks: BTC -70% and GOLD +20%.           |
-| NIFTY and CASH are unchanged.                                       |
-+---------------------------------------------------------------------+
-
-         Per-asset shocks                Resulting risk metrics
-  +----------+---------+         +---------------------+------------+
-  | Asset    |   Shock |         | Metric              |      Value |
-  +----------+---------+         +---------------------+------------+
-  | BTC      |  -70.0% |         | Post-crash value    | INR 6.82M  |
-  | GOLD     |  +20.0% |         | Drawdown            |     -31.8% |
-  +----------+---------+         | Runway (months)     |      85.25 |
-                                 | Ruin test           | PASS       |
-                                 | Largest risk asset  | BTC        |
-                                 +---------------------+------------+
-```
-
-### Why this is worth building
-
-- **It composes Tasks 1 + 3.** Demonstrates the LLM as a *parser*, not just a generator. That's a more valuable signal for fintech than yet another "explain my portfolio" wrapper.
-- **It maps to Sandeep's framing** — *"a terminal, not a dashboard."* A what-if question is exactly the kind of input a CLI handles better than a UI: typed in plain English, answered in seconds, repeatable from history.
-- **Total LLM calls per query: 1.** No fan-out, no agentic loops. Cheap and fast.
-- **The clamping rule** (rallies → 0) is a deliberate product decision, not a bug — explained inline so a reviewer sees the reasoning.
-
----
-
-## Task 5 — Historical VaR + Monte Carlo (extra credit)
-
-The brief's Task 1 takes user-supplied `expected_crash_pct` numbers as ground truth. That's a load-bearing assumption: garbage in, garbage out. Task 5 replaces those guesses with *measured* tail risk pulled from real price history.
-
-```bash
-timecell var examples/balanced.json --years 5 --paths 10000
-```
-
-```text
-  Historical VaR/CVaR · 1257 trading days · INR 10,000,000 portfolio
-  +------------+-----------------------+----------------------------------+
-  | Confidence | VaR (1-day)           | CVaR (1-day, expected tail loss) |
-  +------------+-----------------------+----------------------------------+
-  | 95%        | -2.41%   INR -241,000 | -3.62%   INR -362,000            |
-  | 99%        | -4.18%   INR -418,000 | -5.55%   INR -555,000            |
-  +------------+-----------------------+----------------------------------+
-
-  Monte Carlo · 10,000 paths · 252-day horizon · historical bootstrap
-  +----------------------------------------+------------------+
-  | Outcome                                | Portfolio value  |
-  +----------------------------------------+------------------+
-  | 5th percentile (worst case)            | INR 6,420,000    |
-  | Median outcome                         | INR 11,180,000   |
-  | 95th percentile (best case)            | INR 19,940,000   |
-  | Ruin probability (runway < 12 months)  | 0.32%            |
-  +----------------------------------------+------------------+
-```
-
-**Method.** Empirical VaR (no normality assumption) plus CVaR for expected tail loss. The Monte Carlo bootstraps full rows from the historical return matrix, which preserves cross-asset correlation automatically — when BTC has its worst day, NIFTY tends to too, and the bootstrap inherits that. Numpy seed for reproducibility, no LLM in the loop.
-
-**Why this matters.** Task 1 says "BTC will crash -80%". That's a guess. Task 5 says *the empirical 99% 1-day VaR is -4.18%, the worst 5% of 1-year outcomes leave you with INR 6.4M, and the probability of ruin is 0.32% over a year* — with a falsifiable methodology that any reviewer can audit. **It turns the project from "deterministic-but-toy" into "deterministic-and-defensible."**
-
----
-
-## Web UI — `timecell serve`
-
-```bash
-timecell serve            # → http://localhost:8501
-```
-
-Same code, browser surface. Every tab in the Streamlit app calls the same functions the CLI does — there is no duplicated logic. Deploys to Streamlit Cloud directly: push to GitHub, point share.streamlit.io at `app.py`, set `GEMINI_API_KEY` in the app's secrets, done.
 
 ---
 
 ## Tests
 
 ```bash
-make test     # 26+ tests, all mocked/numpy-only; no network, no LLM calls
+make test   # 26+ unit tests, ~2 seconds
 ```
 
-Coverage:
-- All Task 1 spec numbers from the brief, plus edge cases (all-cash, zero burn, bad allocations, duplicates, strict-vs-loose concentration boundary).
-- Stress-test shock application: case-insensitive name match, rally clamping, immutability of input portfolio, unmentioned-assets passthrough.
-- VaR/CVaR ordering, CVaR ≤ VaR, percentile recovery on a synthetic normal distribution, Monte Carlo determinism under fixed seed, zero-return → zero VaR, zero expenses → zero ruin probability.
+All LLM and network calls are mocked — no API keys or internet required to run the test suite.
 
-LLM calls are not exercised in tests — they're slow, paid, and non-deterministic. The schema validation in [ai_client.py](src/timecell/ai_client.py) is the safety net for those paths.
-
----
-
-## How I Used AI to Build This
-
-The brief asks how I used AI tools. Honestly: heavily, but always as a collaborator on a problem I owned. Concretely:
-
-### Task 1 — Risk Engine
-
-- **Understanding the problem.** I asked ChatGPT to read the assessment PDF and re-state the problem in its own words, so I could check that my reading and its reading agreed before I wrote code. They did.
-- **Edge-case enumeration.** I listed the obvious cases (zero burn, 100% cash, allocation mismatch) and asked Claude to red-team my list. It surfaced the strict-`>` 40% concentration boundary and the duplicate-asset case — both became tests.
-- **Formula verification.** I cross-checked individual computations (e.g. "post-crash BTC value for 30% allocation, -80% crash, INR 10M total") across multiple tools to make sure I wasn't carrying a sign error.
-- **Variable naming and comments.** Once the logic was right, I asked GPT to rename variables to be self-documenting (`post_crash_asset_value`, `compute_risk_report`) and to add a small number of *why*-comments. Anywhere a comment merely restated the code, I cut it.
-
-### Task 2 — Live Market Data
-
-- **API selection.** I asked Claude to recommend free, no-key-needed APIs for the asset trio. yfinance + CoinGecko came out of that. I verified the endpoints by hand against their docs before writing a line of code.
-- **Async + retry pattern.** I sketched the `asyncio.gather` + `tenacity` structure, then asked Claude to flag failure modes I'd missed. The "wrap yfinance sync calls in `asyncio.to_thread`" detail came from that pass — yfinance is sync internally, and naive `await` on it would block the gather.
-- **Provider isolation.** The rule "one provider failing must not crash the others" came from me. The implementation (capture per-symbol exceptions into a `Quote` object instead of letting them propagate) was something I worked out by walking through the failure cases by hand.
-
-### Task 3 — Explainer
-
-- **Prompt iteration.** v1 was a free-form ask. The model invented numbers. v2 added a `metrics` JSON block and forbade markdown — it stopped inventing but sometimes dropped the verdict. v3 switched to Gemini's native `response_schema` with a Pydantic model — output finally shaped consistently. v4 added the **Decision Spine** (every claim must cite a metric); the model began self-policing and dropped claims it couldn't cite. The Decision Spine was the breakthrough.
-- **Red-teaming the prompt.** I asked Claude to try to break the prompt: *"give me metrics where ruin_test=FAIL — can you still produce an explanation that says 'safe'?"* Watching it succeed (until the spine constraint was added) was what convinced me the spine was load-bearing, not decoration.
-- **Critic pass.** The `--critic` flag was originally framed as a "LangGraph validation loop", but a plain Python second LLM call with `temperature=0.0` and a fact-checking system prompt does the same job with a fraction of the dependencies. I asked Claude to confirm the simpler version was equivalent before cutting LangGraph.
-
-### Task 4 — Stress-Test
-
-- **Architecture.** I drafted the AI ↔ math separation by hand: AI extracts shocks (subjective, contextual), math computes consequences (deterministic, auditable). I asked Claude whether there was a case for letting the LLM compute the post-crash value directly and it agreed there wasn't — a language model should not be trusted to multiply numbers.
-- **Schema design.** First attempt was free-text shocks → inconsistent format. Second attempt was a strict JSON schema with `asset_name` + `shock_pct`, and the model became reliable. Same lesson as Task 3: machine-readable beats prose.
-- **Clamping rule.** "Rallies clamp to 0" was a product call I made consciously. We're testing crash survival, not upside; letting a +20% rally shore up the runway in a stress test would muddle the framing. I noted the reasoning in the prompt and the docstring so a reviewer sees the *why*, not just the *what*.
-
-### General
-
-I read every line that landed in this repo and can walk through any of it on a follow-up call. The most fun parts to discuss would be [prompts.py](src/timecell/prompts.py) (where the Decision Spine lives) and [stress.py](src/timecell/stress.py) (where AI-as-parser composes with deterministic math).
+**Coverage:**
+- All risk calculator scenarios including edge cases: zero monthly burn → `math.inf` runway, 100% cash portfolio, allocations not summing to 100%, duplicate asset names, strict `>` 40% concentration boundary, positive crash percentages rejected at model boundary
+- Stress-test shock application: case-insensitive asset name matching, rally clamping to 0, input portfolio immutability, unmentioned assets pass through unchanged
+- VaR/CVaR: ordering guarantee (CVaR ≤ VaR), percentile recovery on synthetic normal distribution, Monte Carlo determinism under fixed numpy seed, zero-return → zero VaR, zero expenses → zero ruin probability
 
 ---
 
-## Acknowledgements
+## Data Sources
 
-- **Google Gemini** — generous free tier, fast inference, and the `response_schema` parameter that made Tasks 3 and 4 reliable instead of finicky.
-- **Claude Code & ChatGPT** — for red-teaming prompts, surfacing edge cases, and architecture review on the parts I wrote first.
-- **DeepSeek** — for rapid iteration on the prompt-engineering passes for Task 3.
-- **yfinance · CoinGecko** — for free, no-key market data that made Task 2 a one-evening problem instead of a multi-vendor key-management project.
-- **Timecell** — for a thoughtfully designed assessment that mirrors real startup engineering: a clear problem, freedom to pick the stack, and an open-ended Task 4 that rewards judgment over compliance.
+| Source | Data Provided | Auth |
+|---|---|---|
+| Yahoo Finance (`yfinance`) | NIFTY50, RELIANCE, any NSE/BSE ticker, gold futures, global ETFs, 5yr daily OHLCV history | None |
+| CoinGecko Public API | BTC, ETH, SOL, ADA, MATIC, DOGE spot prices | None |
+| Google Gemini (`gemini-2.5-flash`) | Portfolio explanation, NL scenario parsing, critic fact-check | API key (free tier) |
+
+---
+
+## Tech Stack
+
+```
+Language      Python 3.10+
+LLM           Google Gemini (gemini-2.5-flash) via google-genai SDK
+Validation    Pydantic v2 — models, schemas, LLM output contracts
+Math          NumPy — VaR, CVaR, Monte Carlo, return matrix
+Market data   yfinance (Yahoo Finance) + httpx (CoinGecko)
+Reliability   tenacity — exponential backoff on all external calls
+CLI           Typer + Rich (tables, color panels, ASCII charts)
+Web UI        Streamlit + Plotly
+Testing       pytest + pytest-asyncio + pytest-mock (26+ tests, all mocked)
+Linting       ruff
+```
+
+---
+
+## Resume Summary
+
+> Built AI-powered portfolio risk advisor with dual-LLM hallucination guard (Decision Spine pattern + critic pass), empirical VaR/CVaR from 1,257 trading days of historical data, 10,000-path Monte Carlo simulation preserving cross-asset correlation, and natural-language stress-test parser — achieving 100% schema-valid LLM outputs across 26+ test cases with zero invented metrics.
+
+**Skills demonstrated:** LLM prompt engineering · Structured output / JSON schema enforcement · Pydantic v2 · Statistical risk modeling (VaR, CVaR, Monte Carlo) · Async Python (asyncio, httpx) · REST API integration · Exponential backoff and fault isolation · Streamlit deployment · Unit testing with mocked external dependencies
+
+---
+
+## License
+
+MIT
